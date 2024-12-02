@@ -17,7 +17,7 @@ class CurriculumManager:
         self.resign_threshold = -0.9  # Resign if value prediction below this
         self.resign_counter_threshold = 10  # Number of moves value must stay below threshold
         self.temperature_drop_move = 30  # When to switch from exploration to exploitation
-        self.max_moves = 500
+        self.max_moves = 300 # Due to compute constraints only calculate 300 moves
         
     def update_curriculum(self):
         """Just track games played"""
@@ -274,7 +274,7 @@ class AlphaZero:
         self.replay_buffer = ReplayBuffer() # Stores previous games
         self.curriculum = CurriculumManager() # Different training logic for early stages
         self.temperature = 1
-        self.num_simulations = 800
+        self.num_simulations = 600 # paper is 800
         self.c_puct = 1
         self.batch_size = 32
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
