@@ -12,126 +12,43 @@ import time
 from indexing import move_to_index
 
 class CurriculumManager:
-    '''
-    Early training focuses on measuring board material, but later focuses on wins/losses
-
-    The initial model lacks the ability to checkmate, so this helps the model to learn initially.
-    '''
     def __init__(self):
-        self.phase = 0
         self.games_played = 0
-        self.max_moves = 30  # Start with shorter games
-        self.piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9, 'K': 0}
+        self.resign_threshold = -0.9  # Resign if value prediction below this
+        self.resign_counter_threshold = 10  # Number of moves value must stay below threshold
+        self.temperature_drop_move = 30  # When to switch from exploration to exploitation
+        self.max_moves = 500
         
     def update_curriculum(self):
-        """Update curriculum based on games played"""
-        if self.games_played > 100:
-            self.phase = 1
-            self.max_moves = 60
-        if self.games_played > 200:
-            self.phase = 2
-            self.max_moves = 300
-            
+        """Just track games played"""
+        self.games_played += 1
+
     def get_position_value(self, board: chess.Board) -> float:
-        """Get position value based on current curriculum phase"""
+        """
+        Get position value from current player's perspective.
+        Only terminal positions have definitive values:
+        1 for win, -1 for loss, 0 for draw
+        """
         if board.is_game_over():
             if board.is_checkmate():
-                return -1 if board.turn else 1
-            return 0
+                return -1  # Current player lost (opponent checkmated them)
+            return 0  # Draw (stalemate, repetition, insufficient material, etc.)
             
-        # Phase 0: Material only
-        if self.phase == 0:
-            return self._get_material_value(board)
-        # Phase 1: Material + piece activity
-        elif self.phase == 1:
-            return self._get_material_value(board) * 0.7 + self._get_activity_value(board) * 0.3
-        # Phase 2: Full evaluation
-        else:
-            material = self._get_material_value(board) * 0.5
-            activity = self._get_activity_value(board) * 0.3
-            king_safety = self._get_king_safety_value(board) * 0.2
-            return material + activity + king_safety
-            
-    def _get_material_value(self, board: chess.Board) -> float:
-        """Position evaluation"""
-        # Material
-        material_score = 0
-        piece_values = {'P': 1, 'N': 3, 'B': 3.2, 'R': 5, 'Q': 9}
+        return 0  # Non-terminal positions don't have a defined value
+
+    def should_resign(self, value_history):
+        """Check if position is hopeless based on recent neural network evaluations"""
+        if len(value_history) < self.resign_counter_threshold:
+            return False
         
-        # Center control (e4,e5,d4,d5)
-        center_squares = {chess.E4, chess.E5, chess.D4, chess.D5}
-        center_control = 0
-        
-        # Piece activity
-        mobility_score = 0
-        
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece:
-                # Material counting
-                value = piece_values.get(piece.symbol().upper(), 0)
-                material_score += value if piece.color else -value
-                
-                # Center control
-                if square in center_squares:
-                    center_control += 0.5 if piece.color else -0.5
-                    
-                # Piece mobility (count legal moves)
-                if piece.color == board.turn:
-                    mobility_score += len(list(board.attacks(square))) * 0.1
-        
-        # King safety (count attacked squares near king)
-        king_square = board.king(board.turn)
-        if king_square:
-            king_danger = len(list(board.attackers(not board.turn, king_square))) * -0.5
-        else:
-            king_danger = 0
-        
-        # Combine scores with different weights
-        total_score = (material_score * 1.0 + 
-                      center_control * 0.3 + 
-                      mobility_score * 0.2 + 
-                      king_danger * 0.3)
-        
-        # Use a smaller denominator for more variation
-        return np.tanh(total_score / 15)
-            
-    def _get_activity_value(self, board: chess.Board) -> float:
-        """Calculate piece activity (mobility and center control)"""
-        mobility_score = 0
-        center_squares = {chess.E4, chess.E5, chess.D4, chess.D5}
-        
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece:
-                # Mobility
-                attacks = len(list(board.attacks(square)))
-                mobility_score += attacks if piece.color else -attacks
-                
-                # Center control
-                if square in center_squares:
-                    mobility_score += 2 if piece.color else -2
-                    
-        return np.tanh(mobility_score / 50)
-        
-    def _get_king_safety_value(self, board: chess.Board) -> float:
-        """Evaluate king safety"""
-        safety_score = 0
-        
-        for color in [chess.WHITE, chess.BLACK]:
-            king_square = board.king(color)
-            if king_square:
-                # Count attackers near king
-                attackers = 0
-                for sq in chess.SQUARES:
-                    if board.piece_at(sq) and board.piece_at(sq).color != color:
-                        if chess.square_distance(sq, king_square) <= 2:
-                            attackers += 1
-                
-                mult = 1 if color else -1
-                safety_score += mult * (-attackers)
-                
-        return np.tanh(safety_score / 10)
+        recent_values = value_history[-self.resign_counter_threshold:]
+        return all(v < self.resign_threshold for v in recent_values)
+
+    def get_temperature(self, move_number):
+        """Temperature schedule for move selection"""
+        if move_number < self.temperature_drop_move:
+            return 1.0  # High temperature for exploration
+        return 0.1  # Low temperature for exploitation
 
 class ReplayBuffer:
     '''
@@ -298,7 +215,7 @@ class ChessNet(nn.Module):
         value = self.value_head(x)
         value = value.view(-1, 64 * 64)
         value = self.value_fc(value)
-        value = torch.tanh(value)
+        #value = torch.tanh(value)
         
         # Auxiliary piece location predictions
         #piece_locations = self.piece_location_head(x)
@@ -357,52 +274,79 @@ class AlphaZero:
         self.replay_buffer = ReplayBuffer() # Stores previous games
         self.curriculum = CurriculumManager() # Different training logic for early stages
         self.temperature = 1
-        self.num_simulations = 200
-        self.c_puct = 0.9
+        self.num_simulations = 800
+        self.c_puct = 1
         self.batch_size = 32
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         
-
     def self_play_game(self) -> List[Tuple]:
         """Play a full game, returning training data."""
         board = chess.Board()
-        game_data = []
+        game_history = []
         moves_made = 0
+        value_history = []  # Track recent value predictions for resignation
         
         while not board.is_game_over() and moves_made < self.curriculum.max_moves:
-            state_tensor = board_to_tensor(board) # Takes current position and converts it to a tensor
+            state_tensor = board_to_tensor(board)
+            current_player = board.turn
             
-            # Get move probabilities from MCTS
-            actions, full_policy, original_probs = self.get_action_probs(board, self.temperature)
+            # Get move probabilities from MCTS using temperature schedule
+            temperature = self.curriculum.get_temperature(moves_made)
+            actions, full_policy, original_probs = self.get_action_probs(board, temperature)
             if actions is None:
-                print('No available actions. Ending match.')
+                break
+            
+            # Get neural network's evaluation
+            with torch.no_grad():
+                _, value_pred = self.model(state_tensor.unsqueeze(0).to(self.device))
+                value_pred = value_pred.item()
+            
+            value_history.append(value_pred)
+            
+            # Check for resignation
+            if self.curriculum.should_resign(value_history):
+                # Resign gives a loss
+                final_value = -1
                 break
                 
-            game_data.append([
-                state_tensor,
-                full_policy,  # Store fixed-size policy vector
-                None  # Value will be updated when game ends
-            ])
+            game_history.append({
+                'state': state_tensor,
+                'policy': full_policy,
+                'player': current_player,
+                'board': board.copy()  # Store board state for debugging
+            })
             
-            # Select move using original probabilities
-            action_idx = np.random.choice(len(actions), p=original_probs)  # Use original probs directly
+            # Select and make move
+            action_idx = np.random.choice(len(actions), p=original_probs)
             move = actions[action_idx]
             board.push(move)
             moves_made += 1
         
-        # Get game outcome using curriculum
-        value = self.curriculum.get_position_value(board) # Note: this value gets overriden if the game is won.
+        # Get final position value
+        if board.is_game_over():
+            final_value = self.curriculum.get_position_value(board)
+        else:
+            final_value = -.01  # Non-terminal game end (max moves reached)
         
-        # Update values in game data
-        for data in game_data:
-            data[2] = value
-            value = -value # Flip for opponent's position
-
-        # Update curriculum
-        self.curriculum.games_played += 1
+        # Convert game history to training data
+        game_data = []
+        current_value = final_value
+        
+        for entry in reversed(game_history):
+            # Store state and policy with value from that player's perspective
+            game_data.append([
+                entry['state'],
+                entry['policy'],
+                current_value
+            ])
+            current_value = -current_value
+        
+        game_data.reverse()
+        
+        # Update games played
         self.curriculum.update_curriculum()
-            
+                
         return game_data, moves_made
 
 
@@ -445,14 +389,19 @@ class AlphaZero:
                     )
                 node.is_expanded = True
             else:
-                value = self.curriculum.get_position_value(board)
-                #value = get_game_outcome(node.board) # Score for win/loss otherwise board material
+                # Get terminal value from the perspective of the player who just moved
+                value = self.curriculum.get_position_value(node.board)
+                #if not node.board.turn:  # If it's black's turn, value is already from their perspective
+                #    value = -value
             
             # Backup
+            # Values are propagated up the tree, flipping at each level
+            # because parent nodes alternate between players
+            current_value = value
             for node in reversed(search_path):
-                node.value_sum += value
+                node.value_sum += current_value
                 node.visit_count += 1
-                value = -value # Flip for opponent's position
+                current_value = -current_value  # Flip for parent's perspective
         
         return root
 
@@ -498,11 +447,16 @@ class AlphaZero:
         # Calculate losses
         policy_loss = -torch.sum(target_policies * F.log_softmax(policy_pred, dim=1)) / target_policies.size(0)
         value_loss = F.mse_loss(value_pred, target_values)
-        total_loss = policy_loss + (value_loss * 2)
+        
+        total_loss = policy_loss + value_loss * 4
         
         # Backprop
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        # Add gradient clipping to prevent value predictions from exploding
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+    
         self.optimizer.step()
         
         return policy_loss.item(), value_loss.item()
@@ -521,7 +475,7 @@ class AlphaZero:
             # Training phase
             policy_loss, value_loss = self.train_step()
             
-            if iteration % 10 == 0:
+            if iteration % 5 == 0:
                 # Sample a batch for monitoring
                 states, target_policies, values = self.replay_buffer.sample(min(10, len(self.replay_buffer)))
                 
@@ -530,21 +484,22 @@ class AlphaZero:
                     # Convert to probabilities
                     pred_policies = F.softmax(pred_policies, dim=1)
 
-                
+
                 print(f"Iteration {iteration}")
-                print(f"Curriculum Phase: {self.curriculum.phase}")
-                print(f"Max Moves: {self.curriculum.max_moves}")
                 print(f"Moves Made: {moves_made}")
                 print(f"Policy Loss: {policy_loss:.4f}")
                 print(f"Value Loss: {value_loss:.4f}")
                 print(f"Buffer size: {len(self.replay_buffer)}")
                 print(f"Sample predictions:")
-                print("Values - Predicted vs Actual:")
-                for i in range(5):  # Show first 5 samples
-                    print(f"  First Position {i+1}: {pred_values[i].item():.4f} vs {values[i].item():.4f}")
 
-                for i in range(5):  # Show first 5 samples
-                    print(f"  Last Position {i+1}: {pred_values[-i].item():.4f} vs {values[-i].item():.4f}")
+                # Print sequential data
+                for i in range(min(5, len(game_data))):
+                    print(f"Position {i}: Player {'White' if i % 2 == 0 else 'Black'}, "
+                          f"Value: {game_data[i][2]:.4f}")
+                
+                print("Values - Predicted vs Actual:")
+                for i in range(5):  # Show first 5 samples (random order)
+                    print(f"  First Position {i+1}: {pred_values[i].item():.4f} vs {values[i].item():.4f}")
                 
                 print("\nTop 3 Policy Predictions vs Targets:")
                 for i in range(3):  # Show first 5 samples
